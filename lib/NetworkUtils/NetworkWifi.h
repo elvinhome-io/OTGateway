@@ -20,13 +20,19 @@ namespace NetworkUtils {
         NetworkConnection::reset();
         this->context->delayCallback(1000);
 
-      } else if (this->isAssociated() && !this->hasCredentials()) {
+        return;
+      }
+
+      if (this->isAssociated() && !this->hasCredentials()) {
         Log.sinfoln(FPSTR(L_NETWORK), F("Reset"));
         this->resetWifi();
         NetworkConnection::reset();
         this->context->delayCallback(1000);
 
-      } else if (this->isAssociated()) {
+        return;
+      }
+
+      if (this->isAssociated()) {
         this->attempt.disarm();
 
         if (!this->connected) {
@@ -49,46 +55,51 @@ namespace NetworkUtils {
         }
         #endif
 
-      } else {
-        if (this->connected) {
-          this->disconnectedTime = millis();
-          this->connected = false;
-          this->attempt.arm(this->failedConnectTimeout);
+        return;
+      }
 
-          Log.sinfoln(
-            FPSTR(L_NETWORK),
-            F("Disconnected, reason: %d, uptime: %lu s."),
-            NetworkConnection::getDisconnectReason(),
-            (millis() - this->connectedTime) / 1000
-          );
+      // the association is down: track the downtime and keep asking for the network
+      if (this->connected) {
+        this->disconnectedTime = millis();
+        this->connected = false;
+        this->attempt.arm(this->failedConnectTimeout);
+
+        Log.sinfoln(
+          FPSTR(L_NETWORK),
+          F("Disconnected, reason: %d, uptime: %lu s."),
+          NetworkConnection::getDisconnectReason(),
+          (millis() - this->connectedTime) / 1000
+        );
+      }
+
+      if (!this->hasCredentials()) {
+        this->attempt.disarm();
+
+        return;
+      }
+
+      if (!this->attempt.isArmed()) {
+        this->attempt.arm(this->failedConnectTimeout);
+      }
+
+      if (this->isConnecting() && millis() - this->prevReconnectingTime > this->resetConnectionTimeout) {
+        Log.swarningln(FPSTR(L_NETWORK), F("Connection timeout, reset wifi..."));
+        this->resetWifi();
+        NetworkConnection::reset();
+        this->context->delayCallback(250);
+
+        return;
+      }
+
+      if (!this->isConnecting() && (!this->prevReconnectingTime || millis() - this->prevReconnectingTime > this->reconnectInterval)) {
+        Log.sinfoln(FPSTR(L_NETWORK), F("Try connect..."));
+
+        NetworkConnection::reset();
+        if (!this->connect(true, this->connectionTimeout)) {
+          Log.straceln(FPSTR(L_NETWORK), F("Connection failed. Status: %d, reason: %d, raw reason: %d"), NetworkConnection::getStatus(), NetworkConnection::getDisconnectReason(), NetworkConnection::rawDisconnectReason);
         }
 
-        if (!this->hasCredentials()) {
-          this->attempt.disarm();
-
-          return;
-        }
-
-        if (!this->attempt.isArmed()) {
-          this->attempt.arm(this->failedConnectTimeout);
-        }
-
-        if (this->isConnecting() && millis() - this->prevReconnectingTime > this->resetConnectionTimeout) {
-          Log.swarningln(FPSTR(L_NETWORK), F("Connection timeout, reset wifi..."));
-          this->resetWifi();
-          NetworkConnection::reset();
-          this->context->delayCallback(250);
-
-        } else if (!this->isConnecting() && (!this->prevReconnectingTime || millis() - this->prevReconnectingTime > this->reconnectInterval)) {
-          Log.sinfoln(FPSTR(L_NETWORK), F("Try connect..."));
-
-          NetworkConnection::reset();
-          if (!this->connect(true, this->connectionTimeout)) {
-            Log.straceln(FPSTR(L_NETWORK), F("Connection failed. Status: %d, reason: %d, raw reason: %d"), NetworkConnection::getStatus(), NetworkConnection::getDisconnectReason(), NetworkConnection::rawDisconnectReason);
-          }
-
-          this->prevReconnectingTime = millis();
-        }
+        this->prevReconnectingTime = millis();
       }
     }
 
@@ -224,7 +235,7 @@ namespace NetworkUtils {
 
       wifi_station_dhcpc_set_maxtry(5);
       #endif
-      
+
       #if defined(ARDUINO_ARCH_ESP32) && ESP_ARDUINO_VERSION_MAJOR < 3
       // Nothing. Because memory leaks when turn off WiFi on ESP32 SDK < 3.0.0
       return true;
@@ -233,7 +244,15 @@ namespace NetworkUtils {
       #endif
     }
 
+    /**
+     * @brief Ask for a fresh connect
+     *
+     * The attempt window is armed here so the ladder keeps the fallback AP out of the way while
+     * the station works on this reconnect; it expires like any other failed attempt.
+     */
     void reconnect() {
+      this->attempt.arm(this->failedConnectTimeout);
+
       this->reconnectFlag = true;
     }
 
@@ -299,6 +318,13 @@ namespace NetworkUtils {
         WiFi.reconnect();
 
       } else {
+        #ifdef ARDUINO_ARCH_ESP32
+        // the interface keeps a static address from an earlier association, so the addressing has
+        // to be reset before the station reconnects or the switch back to DHCP never takes effect
+        const IPAddress noIp(0, 0, 0, 0);
+        WiFi.config(noIp, noIp, noIp);
+        #endif
+
         WiFi.begin(this->context->staSsid, this->context->staPassword, this->context->staChannel, nullptr, true);
       }
 
